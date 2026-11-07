@@ -290,7 +290,7 @@ footer .wrap{display:flex;flex-direction:column;gap:16px;padding-block:36px calc
       <h2>One rule. No ceiling.</h2>
       <p id="ruleP1"></p>
       <p id="ruleP2"></p>
-      <p>The market cap refreshes every 30 seconds from DexScreener, so what you see is where the chart is.</p>
+      <p>The market cap is checked every <b id="ruleRefresh">2 seconds</b> on DexScreener, so what you see is where the chart is.</p>
     </div>
     <div class="spec">
       <div class="formula">
@@ -358,7 +358,7 @@ const CONFIG = {
   // Growth curve: [market cap in USD, ball diameter in metres]. Exponential between points,
   // and the last rate keeps going after the final point.
   curve: [[0, 0.16], [100000, 33], [1000000, 12742000]],   // 16 cm → 10-storey building → the Earth
-  pollMs: 30000,
+  pollMs: 2000,          // live refresh: every 2 seconds (paused while the tab is hidden)
   demoStart: 42000
 };
 /* ============================================== */
@@ -894,7 +894,7 @@ $('fNote').textContent = `n = market cap ÷ ${fmtUsd(STEP)}, up to ${fmtUsd(s0.t
 const specRows = [['Starting size', '16 cm'], ['Step size', fmtUsd(STEP) + ' of market cap']];
 SEGS.forEach((sg, i) => specRows.push([i === 0 ? `Growth per step, up to ${fmtUsd(sg.toUsd)}` : i === SEGS.length - 1 ? `Growth per step, after ${fmtUsd(sg.fromUsd)}` : `Growth per step, ${fmtUsd(sg.fromUsd)}–${fmtUsd(sg.toUsd)}`, pct(sg.rate)]));
 specRows.push(['10-storey building at', fmtUsd(usdForDiameter(33))], ['Earth-sized at', fmtUsd(EARTH_USD)], ['Universe-sized at', fmtUsd(usdForDiameter(8e26))],
-  ['Data refresh', 'Every ' + Math.round(CONFIG.pollMs/1000) + ' s'], ['Data source', 'DexScreener']);
+  ['Data refresh', 'Every ' + +(CONFIG.pollMs/1000).toFixed(1) + ' s'], ['Data source', 'DexScreener']);
 $('specList').innerHTML = specRows.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
 $('ladder').innerHTML = MILESTONES.map(m => `<li><span class="dot"></span><span class="nm">${m.name}</span><span class="sz">${fmtSize(m.d)}</span><span class="mc">${fmtUsd(m.usd)}</span><span class="st">Locked</span><i class="prog"></i></li>`).join('');
 const ladderEls = [...$('ladder').children];
@@ -1106,7 +1106,8 @@ function frame(now){
 }
 
 /* ---------- live data (DexScreener) ---------- */
-let liveCa = null, pollTimer = null, simTimer = null;
+let liveCa = null, pollTimer = null, simTimer = null, backoffUntil = 0;
+$('ruleRefresh').textContent = +(CONFIG.pollMs/1000).toFixed(1) + (CONFIG.pollMs === 1000 ? ' second' : ' seconds');
 const msg = html => { $('msg').innerHTML = html; };
 const baseMsg = () => 'Every <b>$' + CONFIG.stepUsd.toLocaleString('en-US') + '</b> of market cap = one growth step. Earth-sized at <b>' + fmtUsd(EARTH_USD) + '</b>.';
 function setMode(isLive, label){
@@ -1120,9 +1121,11 @@ async function fetchToken(ca){
   let pairs = [];
   try {
     const url = CONFIG.dexChainId ? `https://api.dexscreener.com/tokens/v1/${CONFIG.dexChainId}/${encodeURIComponent(ca)}` : `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(ca)}`;
-    const r = await fetch(url); const j = r.ok ? await r.json() : null;
+    const r = await fetch(url, { cache: 'no-store' });
+    if (r.status === 429) throw new Error('rate');
+    const j = r.ok ? await r.json() : null;
     pairs = Array.isArray(j) ? j : (j?.pairs || []);
-  } catch (e) { throw new TypeError('network'); }
+  } catch (e) { if (e.message === 'rate') throw e; throw new TypeError('network'); }
   if (CONFIG.dexChainId) pairs = pairs.filter(p => p.chainId === CONFIG.dexChainId);
   const own = pairs.filter(p => (p.baseToken?.address || '').toLowerCase() === ca.toLowerCase());
   if (own.length) pairs = own;
@@ -1140,8 +1143,9 @@ async function poll(){
     setMode(true, '$' + d.symbol);
     setMcap(d.mcap); setMarket(d); setContract(liveCa);
     if (!branded){ branded = true; setBrand(CONFIG.name || d.name, '$' + d.symbol, d.img); }
-    msg(baseMsg() + ' Updated ' + new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + '.');
+    msg(baseMsg() + ' Updated ' + new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) + '.');
   } catch (e) {
+    if (e.message === 'rate'){ backoffUntil = Date.now() + 20000; return; } // too many requests: pause 20 s
     if (LOCKED && !ADMIN){ // public site: never fall back to demo, just keep retrying
       $('dataChip').textContent = 'Waiting for DexScreener'; $('dataChip').className = 'chip demo'; return;
     }
@@ -1154,13 +1158,22 @@ async function poll(){
 }
 async function goLive(ca){
   ca = (ca || '').trim(); if (!ca){ msg('Paste the coin’s contract address first.'); return; }
-  stopSim(); liveCa = ca; clearInterval(pollTimer); pollTimer = null;
+  stopSim(); liveCa = ca; clearTimeout(pollTimer); pollTimer = null;
   msg('Loading market cap…');
   try { localStorage.setItem('ballcap.ca', ca); } catch (e) {}
   await poll();
-  if (liveCa) pollTimer = setInterval(poll, CONFIG.pollMs);
+  if (liveCa) schedule();
 }
-function stopLive(){ liveCa = null; clearInterval(pollTimer); pollTimer = null; setMode(false); setContract(CONFIG.contract); }
+// one request at a time, every CONFIG.pollMs; skipped while the tab is hidden or after a rate-limit reply
+function schedule(){
+  pollTimer = setTimeout(async () => {
+    if (!liveCa) return;
+    if (!document.hidden && Date.now() >= backoffUntil) await poll();
+    if (liveCa) schedule();
+  }, CONFIG.pollMs);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && liveCa){ clearTimeout(pollTimer); poll().then(() => { if (liveCa){ clearTimeout(pollTimer); schedule(); } }); } });
+function stopLive(){ liveCa = null; clearTimeout(pollTimer); pollTimer = null; setMode(false); setContract(CONFIG.contract); }
 
 /* ---------- demo controls ---------- */
 function stopSim(){ clearInterval(simTimer); simTimer = null; $('sim').setAttribute('aria-pressed','false'); }
